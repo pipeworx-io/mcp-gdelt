@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-gdelt",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "GDELT MCP — Global Database of Events, Language, and Tone (free, no auth)",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-c1ef079ecaea0c36157a1ae36c2a5804c52a16878b9ddfa658f922246ab79434",
-    "sourceCommit": "76aa8f5d9b5dc2f665563030647c68e661478864"
+    "sourceHash": "v1-fc68489d83d84fe8df0ac4458b6ae6ec6cad232528fa1dc425c298fd1c3c6cc0",
+    "sourceCommit": "91681e9a4a137fa0051d58e32f38c64b6334af5c"
   }
 }
