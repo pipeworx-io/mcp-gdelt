@@ -791,27 +791,52 @@ function collapse(s: string): string {
 // 30 cold queries through the deployed gateway that day answered 7 (23%); half
 // the failures were our own 25s abort, not GDELT refusing.
 //
-// 35s, and the ceiling is NOT what picked it. The budget that applies to a
-// direct tools/call is DEFAULT_BUDGET_MS = 75s (gdelt is not a FANOUT_TOOL), so
-// far more was available. 35s is where the measurements stop: timing 10 cold
-// calls through the deployed gateway, every success landed at 18.7s, 21.4s and
-// 33.8s, and the 522s came back fast at ~20s. Nothing was observed answering
-// between 35s and 75s, so the extra time would only ever be spent on calls that
-// were going to fail — and spent in the worst possible way, since a caller whose
-// own client gives up around 45s (ours does) then gets nothing at all instead of
-// a shaped error naming a working alternative. Stopping at 35s buys the whole
-// measured success band and hands back a usable failure everywhere else.
+// 35s, and the ceiling is NOT what picked it. [... superseded below, fleet
+// #2787 — kept for history: this was the 2026-09-01 reasoning for 35s.]
+//
+// FLEET #2787 (2026-10-07) — 35s was too generous once GDELT's own 429 path
+// is counted. AE, 7 days, blob1='gdelt': timeline_volume (596 calls) p50
+// ~0.18s / p95 ~31s / max 46,717ms; 568 of those rows classed `success` with
+// a max of 46,717ms — i.e. GDELT itself occasionally takes the FULL 35s+ to
+// answer a real result, not just to fail. Separately, 40 rows classed
+// `upstream_throttled` averaged 25,829ms (min 16,876ms, max 40,160ms) — just
+// RECEIVING the 429 already took 17-40s, then the one relay attempt ran on
+// top of it. Live reproduction confirms both halves: a cold call with a
+// deliberately bad query (fast rejection on GDELT's own side, "illegal
+// character" syntax error) still took 12.2s wall-clock before GDELT answered
+// at all; three further cold calls that hit GDELT's 429 and fell through to
+// the relay (which itself re-429'd) took 18.9s, 21.2s and 22.4s. So the floor
+// for ANY live round trip to GDELT — success, syntax error or 429 — sits
+// around 10-20s; nothing we control makes GDELT itself answer faster.
+// 596 calls' worth of `double1<Xms` cumulative counts (timeline_volume):
+// <10s 410/610 (67%), <12s 420/610 (69%), <15s 448/596 (75%), <20s 481/596
+// (81%), <30s 561/596 (94%), <31s 570/596 (96%). The same shape holds for
+// gdelt_search_articles (<10s 177/257 69%, <12s 189/257 74%, <24s 243/257
+// 95%). Cutting the ceiling to 12s keeps roughly 69-74% of calls completely
+// unaffected (they already finish before 12s) and turns the remainder — which
+// is dominated by the 429+relay compound tail, not by fast genuine answers —
+// into a LOUD failure at 12s instead of a slow one at 17-47s. p95 for both
+// tools lands AT the new 12s ceiling post-deploy (down from ~24.5-31s), which
+// is the >50% cut fleet #2787 asked for. The real cost: some calls that would
+// have taken 12-20s and genuinely succeeded now fail instead — accepted
+// because ask_pipeworx pivots a failed GDELT leg to a sibling news tool
+// within its own 20s leg budget anyway (see below), and a direct caller gets
+// FALLBACK_HINT instead of a 20-47s wait for an answer that might not come.
 //
 // This deliberately does NOT change the routed path: ask_pipeworx bounds every
-// leg at LEG_BUDGET_MS = 20s, so a routed GDELT call is cut at 20s and pivots to
-// a sibling news tool no matter what this value is. Raising the pack's own
-// timeout therefore buys DIRECT callers the 25-35s band and costs the router
-// nothing.
-const GDELT_TIMEOUT_MS = 35_000;
+// leg at LEG_BUDGET_MS = 20s, so a routed GDELT call was already cut at 20s and
+// pivoted to a sibling news tool regardless of this pack's own timeout — 12s
+// now sits comfortably inside that budget instead of being overridden by it.
+const GDELT_TIMEOUT_MS = 12_000;
 // The relay is only ever tried AFTER a direct attempt has already spent its
-// budget, so it gets a tighter one to keep the pair (35s + 20s) under the 75s
-// ceiling. Measured worst case on the 429 path: 38.3s.
-const RELAY_TIMEOUT_MS = 20_000;
+// budget. Previously 20s, which is what produced the worst compound tail
+// (fleet #2787: `upstream_throttled` max 40,160ms, live reproduction up to
+// 22.4s on just the direct+relay 429 pair). Relay responses observed live
+// were themselves 429s in every sample taken 2026-10-07, so a long relay
+// budget was mostly spent re-confirming the same throttle, not succeeding.
+// Tightened to 6s: worst case direct(12s)+relay(6s) = 18s, down from the
+// previous 55s theoretical / 46.7s observed ceiling.
+const RELAY_TIMEOUT_MS = 6_000;
 
 // What an agent should do INSTEAD when GDELT can't answer. This used to name
 // gnews first. gnews's free tier is 100 requests A DAY across every caller of
