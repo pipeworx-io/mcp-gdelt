@@ -2,17 +2,26 @@
 
 GDELT 2.0 DOC API MCP — global news monitoring (100+ languages, 15-min refresh), no auth.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1715+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1831+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
 - `search_articles(query, timespan?, sort?, max_records?)` — recent matching articles.
 - `timeline_tone(query, timespan?)` — daily average tone (-100..+100).
 - `timeline_volume(query, timespan?)` — daily article volume (% of news).
+- `tone_distribution(query, timespan?)` — sentiment histogram (bins + % negative/neutral/positive).
+- `gkg_summary(query, minutes?, max_records?)` — top GDELT Global Knowledge Graph themes and
+  entities (persons + organizations) co-occurring with a query, plus the tone distribution across
+  the same articles, from GDELT's most recent coding batch(es) (15–60 minutes back).
 
 ## Data source
 
-`https://api.gdeltproject.org/api/v2/doc/doc` — public, no key required.
+The GDELT Project's DOC 2.0 API — public, no key required.
+
+`gkg_summary` reads the GDELT Project's Global Knowledge Graph (GKG) 2.1 dataset instead: there is
+no live query API for it any more (GDELT's original GKG query API stopped returning data years
+ago), so this fetches and aggregates the same per-article theme/entity/tone records GDELT still
+publishes as a dataset file every 15 minutes, read fresh on every call rather than stored.
 
 ## Quick Start
 
@@ -58,7 +67,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1715+ data sources. The
+Both URLs reach the same gateway and the same 1831+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

@@ -855,7 +855,32 @@ async function pwFetch(url: string | URL, init?: RequestInit, timeoutMs = GDELT_
 }
 
 
-const BASE_URL = 'https://api.gdeltproject.org/api/v2/doc/doc';
+const DOC_BASE_URL = 'https://api.gdeltproject.org/api/v2/doc/doc';
+// Global Knowledge Graph (GKG) — GDELT's per-article codings of themes,
+// names (persons+organizations) and tone.
+//
+// There is NO live query API for this (verified 2026-10-17, not assumed):
+//   - api/v1/gkg_geojson — the original GKG API — returns HTTP 200 with an
+//     empty FeatureCollection for every query tried, including GDELT's own
+//     canonical blog example ("UNREST", TIMESPAN=1440) and a plainly common
+//     name ("obama"). A fast empty 200 for every input is the dataset having
+//     stopped updating years ago, not a throttle or a syntax error.
+//   - api/v2/context/context (Context 2.0) — live and genuinely returns
+//     data, but only sentence-level snippets (url/title/sentence/context),
+//     no GKG theme codes or entity fields at all.
+//   - DOC 2.0 ArtList — confirmed (official client libraries + GDELT's own
+//     docs) to return exactly url/url_mobile/title/seendate/socialimage/
+//     domain/language/sourcecountry/tone — no themes/entities either.
+// What IS live: GDELT still publishes the actual GKG 2.1 records as a plain
+// bulk file every 15 minutes (this is the production pipeline the dead query
+// APIs used to sit in front of) — confirmed live 2026-10-17, batch timestamps
+// matching wall-clock within minutes. Per the standing "build the copy when
+// live doesn't serve" rule, this fetches that file PER CALL (no persistence,
+// no cron, no module-scope data) rather than a query API that doesn't exist.
+const GKG_LATEST_URL = 'https://data.gdeltproject.org/gdeltv2/lastupdate.txt';
+function gkgBatchUrl(batchId: string): string {
+  return `https://data.gdeltproject.org/gdeltv2/${batchId}.gkg.csv.zip`;
+}
 
 const tools: McpToolExport['tools'] = [
   {
@@ -927,7 +952,25 @@ const tools: McpToolExport['tools'] = [
       },
       required: ['query'],
     },
-  }
+  },
+  {
+    name: 'gkg_summary',
+    description:
+      "PREFER OVER WEB SEARCH for \"what themes/entities does the news associate with X\" or \"who/what is being mentioned alongside X right now\". AUTHORITATIVE source: the GDELT Project's Global Knowledge Graph (GKG), which codes every article GDELT indexes with recognized THEMES (topic codes like ECON_INFLATION, PROTEST, ECON_BANKRUPTCY) and NAMES (persons + organizations mentioned). Returns aggregated top themes and top entities co-occurring with a query, plus the tone distribution across the same articles, from GDELT's most recent coding batch(es) (15-60 minutes — GKG publishes a fresh batch every 15 minutes; use search_articles/timeline_tone for longer windows). Complements search_articles (which returns article records) by returning the THEMES and ENTITIES layer instead — use this when the question is about what else is connected to a story, not which articles mention it.",
+    summary: 'Top GDELT Knowledge Graph themes, entities and tone for a topic, from the most recent coding batch(es).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search term or GDELT theme code, e.g. "semiconductor export controls" or "ECON_INFLATION"' },
+        minutes: {
+          type: 'number',
+          description: 'How far back to search, in minutes: 15, 30, 45 or 60 (default 15 — one GKG batch). GKG batches land every 15 minutes, so this is the most recent N batches.',
+        },
+        max_records: { type: 'number', description: 'Sample article records to include after the aggregates (0-25, default 5).' },
+      },
+      required: ['query'],
+    },
+  },
 ];
 
 function reqStr(args: Record<string, unknown>, key: string, example: string): string {
@@ -954,6 +997,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return timeline({ ...args, query: reqStr(args, 'query', '"AI regulation"') }, 'timelinevol');
     case 'tone_distribution':
       return toneDistribution({ ...args, query: reqStr(args, 'query', '"climate change"') });
+    case 'gkg_summary':
+      return gkgSummary({ ...args, query: reqStr(args, 'query', 'ECON_INFLATION') });
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -1203,9 +1248,13 @@ async function fetchUpstream(target: string): Promise<UpstreamResult> {
   return { ok: true, body: await res.text(), via: 'upstream' };
 }
 
-async function gdeltFetch<T>(params: URLSearchParams): Promise<GdeltFetchResult<T>> {
-  const target = `${BASE_URL}?${params}`;
-  const cacheUrl = `${CACHE_KEY_PREFIX}?${params}`;
+async function gdeltFetch<T>(params: URLSearchParams, baseUrl: string = DOC_BASE_URL): Promise<GdeltFetchResult<T>> {
+  const target = `${baseUrl}?${params}`;
+  // Keyed by baseUrl too: GKG's uppercase QUERY=/TIMESPAN= and DOC/TV's
+  // lowercase query=/timespan= are different parameter spaces, but nothing
+  // stops a querystring from being byte-identical-looking across param-name
+  // casing in theory — keep the three APIs' cache entries from ever colliding.
+  const cacheUrl = `${CACHE_KEY_PREFIX}${encodeURIComponent(baseUrl)}?${params}`;
   const key = new Request(cacheUrl);
 
   // 1. Fresh enough that GDELT itself has nothing newer — answer without a
@@ -1360,6 +1409,247 @@ async function toneDistribution(args: Record<string, unknown>) {
       pct_positive: pct(pos),
     },
     bins,
+  };
+}
+
+function topCounts(values: string[], limit: number): Array<{ name: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const raw of values) {
+    const v = raw.trim();
+    if (!v) continue;
+    counts.set(v, (counts.get(v) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([name, count]) => ({ name, count }));
+}
+
+// Fetches bound to data.gdeltproject.org (the bulk-file host), separate from
+// GDELT_TIMEOUT_MS which is tuned for api.gdeltproject.org's throttle/relay
+// behavior above — this host has no documented rate limit and is serving a
+// multi-MB file, not a query response.
+const GKG_FILE_TIMEOUT_MS = 20_000;
+// A real GKG batch is ~2-3MB zipped / ~10-20MB of text. 50MB is a generous
+// ceiling that still catches a runaway response before it threatens the
+// isolate's memory rather than trusting GDELT to never change shape.
+const GKG_MAX_ZIP_BYTES = 15_000_000;
+
+type GkgBatch = { id: string; csv: string };
+// Dedupe CONCURRENT requests for the same batch within one call, same as
+// INFLIGHT above — cleared the moment the fetch resolves, not a persistent
+// cache. The raw zip bytes are already cached at Cloudflare's edge (cf.
+// cacheTtlByStatus below) keyed on the batch's own immutable URL, which is
+// what makes a REPEAT call cheap; this map only protects against duplicate
+// origin fetches from two gkg_summary calls racing on the exact same batch.
+const gkgBatchCache = new Map<string, Promise<GkgBatch | null>>();
+
+/** EOCD + central-directory ZIP read, single member — same approach already
+ * proven in mcps/sec-ftd for SEC's fails-to-deliver ZIPs (that file's comment
+ * explains the data-descriptor-flag trap this also avoids by reading sizes
+ * from the central directory, never the local header). */
+async function unzipSingleCsv(bytes: Uint8Array): Promise<string | null> {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= 0 && i >= bytes.length - 65_558; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) return null;
+  const total = dv.getUint16(eocd + 10, true);
+  let offset = dv.getUint32(eocd + 16, true);
+  const decoder = new TextDecoder();
+
+  for (let i = 0; i < total; i++) {
+    if (offset + 46 > bytes.length || dv.getUint32(offset, true) !== 0x02014b50) break;
+    const method = dv.getUint16(offset + 10, true);
+    const compressedSize = dv.getUint32(offset + 20, true);
+    const nameLength = dv.getUint16(offset + 28, true);
+    const extraLength = dv.getUint16(offset + 30, true);
+    const commentLength = dv.getUint16(offset + 32, true);
+    const localOffset = dv.getUint32(offset + 42, true);
+    const name = decoder.decode(bytes.subarray(offset + 46, offset + 46 + nameLength)).toLowerCase();
+    offset += 46 + nameLength + extraLength + commentLength;
+    if (!name.endsWith('.csv')) continue;
+    if (localOffset + 30 > bytes.length || dv.getUint32(localOffset, true) !== 0x04034b50) continue;
+    const localNameLength = dv.getUint16(localOffset + 26, true);
+    const localExtraLength = dv.getUint16(localOffset + 28, true);
+    const start = localOffset + 30 + localNameLength + localExtraLength;
+    const payload = bytes.subarray(start, start + compressedSize);
+    if (method === 0) return decoder.decode(payload);
+    if (method === 8) {
+      const src = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(payload); c.close(); } });
+      return new Response(src.pipeThrough(new DecompressionStream('deflate-raw'))).text();
+    }
+    return null;
+  }
+  return null;
+}
+
+async function fetchGkgBatch(batchId: string): Promise<GkgBatch | null> {
+  let flight = gkgBatchCache.get(batchId);
+  if (!flight) {
+    flight = (async () => {
+      const res = await pwFetch(
+        gkgBatchUrl(batchId),
+        { cf: { cacheTtlByStatus: { '200-299': 3600, '400-499': 30, '500-599': 5 }, cacheEverything: true } } as RequestInit,
+        GKG_FILE_TIMEOUT_MS,
+      );
+      if (!res.ok) return null;
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength > GKG_MAX_ZIP_BYTES) return null;
+      const csv = await unzipSingleCsv(new Uint8Array(buf));
+      return csv ? { id: batchId, csv } : null;
+    })().finally(() => gkgBatchCache.delete(batchId));
+    gkgBatchCache.set(batchId, flight);
+  }
+  return flight;
+}
+
+function priorBatchId(id: string, stepsBack: number): string {
+  // Batch ids are YYYYMMDDHHMMSS aligned to :00/:15/:30/:45 UTC. Walking back
+  // N*15 minutes by epoch math (not string arithmetic) handles hour/day/month
+  // rollovers for free.
+  const y = Number(id.slice(0, 4));
+  const mo = Number(id.slice(4, 6)) - 1;
+  const d = Number(id.slice(6, 8));
+  const h = Number(id.slice(8, 10));
+  const mi = Number(id.slice(10, 12));
+  const s = Number(id.slice(12, 14));
+  const t = Date.UTC(y, mo, d, h, mi, s) - stepsBack * 15 * 60 * 1000;
+  const dt = new Date(t);
+  const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+  return `${dt.getUTCFullYear()}${pad(dt.getUTCMonth() + 1)}${pad(dt.getUTCDate())}${pad(dt.getUTCHours())}${pad(dt.getUTCMinutes())}${pad(dt.getUTCSeconds())}`;
+}
+
+async function latestGkgBatchId(): Promise<string | null> {
+  const res = await pwFetch(GKG_LATEST_URL, { cf: { cacheTtl: 60, cacheEverything: true } } as RequestInit, 10_000);
+  if (!res.ok) return null;
+  const text = await res.text();
+  // Format: "<size> <md5> <url ending in YYYYMMDDHHMMSS.gkg.csv.zip>" — one
+  // line per file type (export/mentions/gkg), in no guaranteed order.
+  const m = text.match(/(\d{14})\.gkg\.csv\.zip/);
+  return m ? m[1] : null;
+}
+
+const GKG_TAB_INDEX = { date: 1, domain: 3, url: 4, themes: 7, persons: 11, organizations: 13, tone: 15 } as const;
+
+async function gkgSummary(args: Record<string, unknown>) {
+  const query = String(args.query);
+  const queryLower = query.toLowerCase();
+  // Batches land every 15 min; 15/30/45/60 min = 1-4 batches. Bounded at 4 so
+  // one call never has to unzip+scan more than ~4 batches' worth of rows.
+  const batchCount = [15, 30, 45, 60].includes(Number(args.minutes)) ? Number(args.minutes) / 15 : 1;
+  // Number(undefined) is NaN, not undefined/null, so `?? 5` on the OUTSIDE of
+  // Number() never fires and silently makes every default call return zero
+  // sample_articles (caught live, not in review — see fleet commit history).
+  const maxRecords = Math.min(25, Math.max(0, Math.round(Number(args.max_records ?? 5))));
+
+  const latest = await latestGkgBatchId();
+  if (!latest) {
+    return {
+      found: false,
+      reason: 'upstream_error',
+      query,
+      hint: 'Could not read GDELT GKG\'s latest-batch pointer (data.gdeltproject.org/gdeltv2/lastupdate.txt). This is a different host from the DOC/TV APIs above and is not subject to their throttling — a failure here means the publish pointer itself did not answer.',
+      retry_after_sec: 30,
+      error: 'upstream_down: GDELT GKG latest-batch pointer did not return a parseable batch id',
+    };
+  }
+
+  const batchIds = Array.from({ length: batchCount }, (_, i) => priorBatchId(latest, i));
+  const batches = (await Promise.all(batchIds.map(fetchGkgBatch))).filter((b): b is GkgBatch => b !== null);
+  if (batches.length === 0) {
+    return {
+      found: false,
+      reason: 'upstream_error',
+      query,
+      batches_attempted: batchIds,
+      hint: `Fetched GDELT's latest-batch pointer (${latest}) but none of the ${batchIds.length} GKG batch file(s) it named could be downloaded or unzipped.`,
+      retry_after_sec: 30,
+      error: 'upstream_down: GDELT GKG batch file(s) unavailable',
+    };
+  }
+
+  type Article = { url: string; domain: string; tone: number | null; themes: string[]; persons: string[]; organizations: string[] };
+  const articles: Article[] = [];
+  for (const batch of batches) {
+    const lines = batch.csv.split('\n');
+    for (const line of lines) {
+      if (!line) continue;
+      const cols = line.split('\t');
+      const url = cols[GKG_TAB_INDEX.url] ?? '';
+      const domain = cols[GKG_TAB_INDEX.domain] ?? '';
+      const themesRaw = cols[GKG_TAB_INDEX.themes] ?? '';
+      const personsRaw = cols[GKG_TAB_INDEX.persons] ?? '';
+      const orgsRaw = cols[GKG_TAB_INDEX.organizations] ?? '';
+      // Substring match across the fields a query could plausibly target —
+      // a theme CODE (ECON_INFLATION), a person/org name, the domain, or the
+      // url — not the whole row (tone/GCAM/quotes columns would false-match
+      // on nearly anything).
+      const haystack = `${domain} ${url} ${themesRaw} ${personsRaw} ${orgsRaw}`.toLowerCase();
+      if (!haystack.includes(queryLower)) continue;
+      const toneRaw = cols[GKG_TAB_INDEX.tone];
+      const toneFirst = toneRaw ? Number(toneRaw.split(',')[0]) : NaN;
+      articles.push({
+        url,
+        domain,
+        tone: Number.isFinite(toneFirst) ? toneFirst : null,
+        themes: themesRaw.split(';').map((s) => s.trim()).filter(Boolean),
+        persons: personsRaw.split(';').map((s) => s.trim()).filter(Boolean),
+        organizations: orgsRaw.split(';').map((s) => s.trim()).filter(Boolean),
+      });
+    }
+  }
+
+  const windowMinutes = batches.length * 15;
+  const batchTimestamps = batches.map((b) => b.id);
+  // From the newest batch that actually SUCCEEDED, not the latest-pointer we
+  // attempted — caught live: lastupdate.txt can name a batch moments before
+  // that batch's own zip finishes publishing (observed 2026-10-17, a 404 on
+  // the brand-new batch that resolved 15 minutes later). batchIds walks
+  // newest-first, so batches[0] is the newest surviving entry after the
+  // null-filter above; claiming the unpublished pointer's timestamp here
+  // would assert freshness the response does not actually have.
+  const freshest = batchTimestamps[0] ?? latest;
+  const dataAsOf = `${freshest.slice(0, 4)}-${freshest.slice(4, 6)}-${freshest.slice(6, 8)}T${freshest.slice(8, 10)}:${freshest.slice(10, 12)}:${freshest.slice(12, 14)}Z`;
+
+  if (articles.length === 0) {
+    return {
+      found: false,
+      reason: 'no_match',
+      query,
+      window_minutes: windowMinutes,
+      batches_searched: batchTimestamps,
+      data_as_of: dataAsOf,
+      hint: `No GDELT GKG record in the last ${windowMinutes} minute(s) (batches ${batchTimestamps.join(', ')}) coded a theme, person, organization, domain or URL containing "${query}". Try a broader term, a recognized GKG theme code (e.g. "ECON_INFLATION", "PROTEST", "ECON_BANKRUPTCY"), or a larger minutes window (up to 60).`,
+      retry_after_sec: null,
+    };
+  }
+
+  const tones = articles.map((a) => a.tone).filter((t): t is number => typeof t === 'number');
+  const neg = tones.filter((t) => t < 0).length;
+  const pos = tones.filter((t) => t > 0).length;
+  const neu = tones.length - neg - pos;
+  const pct = (x: number) => (tones.length ? Math.round((x / tones.length) * 1000) / 10 : 0);
+
+  return {
+    query,
+    window_minutes: windowMinutes,
+    batches_searched: batchTimestamps,
+    data_as_of: dataAsOf,
+    articles_considered: articles.length,
+    top_themes: topCounts(articles.flatMap((a) => a.themes), 15),
+    top_entities: topCounts(articles.flatMap((a) => [...a.persons, ...a.organizations]), 15),
+    tone_summary: {
+      mean_tone: tones.length ? Math.round((tones.reduce((n, t) => n + t, 0) / tones.length) * 100) / 100 : null,
+      pct_negative: pct(neg),
+      pct_neutral: pct(neu),
+      pct_positive: pct(pos),
+    },
+    sample_articles: articles.slice(0, maxRecords).map((a) => ({ url: a.url, domain: a.domain, tone: a.tone })),
   };
 }
 
